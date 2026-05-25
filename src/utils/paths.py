@@ -5,7 +5,7 @@ All project scripts import from here instead of recomputing paths inline.
 Only this file needs to be updated when the repo is moved or renamed.
 
 Usage:
-    from nemoforge.utils.paths import REPO_ROOT, EXTENSION_DIR, DATASET_DIR
+    from utils.paths import REPO_ROOT, EXTENSION_DIR, DATASET_DIR
 """
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Repo root detection
 # Resolve from this file's location:
-#   src/nemoforge/utils/paths.py -> parents[3] = NemoForge/
+#   src/utils/paths.py -> parents[2] = NemoForge/
 # ---------------------------------------------------------------------------
-REPO_ROOT: Path = Path(__file__).resolve().parents[3]
+REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Core project directories
@@ -39,14 +39,9 @@ SAGE_SCENES_DIR: Path = SAGE_10K_ROOT / "scenes"
 SAGE_KITS_DIR: Path = SAGE_10K_ROOT / "kits"
 
 # ---------------------------------------------------------------------------
-# Benchmark task files
+# FastAPI bridge (replaced by src/api/bridge.py in v2)
 # ---------------------------------------------------------------------------
-NF_CORE_50_JSON: Path = REPO_ROOT / "src" / "nemoforge" / "core" / "nf_core_50.json"
-
-# ---------------------------------------------------------------------------
-# FastAPI bridge  (kept at repo root per project design decision)
-# ---------------------------------------------------------------------------
-BACKEND_DIR: Path = REPO_ROOT / "isaac-sim-backend"
+BACKEND_DIR: Path = REPO_ROOT / "src" / "api"
 
 # ---------------------------------------------------------------------------
 # NemoClaw (standalone sub-project — do NOT move contents)
@@ -92,8 +87,8 @@ def register_project_paths() -> None:
         s = str(p)
         if s not in sys.path:
             sys.path.insert(0, s)
-    # Also add src/ so `from nemoforge.xxx import yyy` works when the package
-    # is not installed via pip (editable install covers this automatically).
+    # Also add src/ so `from simulation import ...`, `from agent import ...` etc.
+    # resolve correctly when running scripts directly without pip install.
     s_src = str(SRC_DIR)
     if s_src not in sys.path:
         sys.path.insert(0, s_src)
@@ -106,12 +101,12 @@ if __name__ == "__main__":
     print("=" * 50)
     items = [
         ("REPO_ROOT", REPO_ROOT),
+        ("SRC_DIR", SRC_DIR),
         ("BACKEND_DIR", BACKEND_DIR),
         ("EXTENSION_DIR", EXTENSION_DIR),
         ("ISAACSIM_PYTHON_BAT", ISAACSIM_PYTHON_BAT),
         ("DATASET_ROOT", DATASET_ROOT),
         ("SAGE_10K_ROOT", SAGE_10K_ROOT),
-        ("NF_CORE_50_JSON", NF_CORE_50_JSON),
     ]
     for name, path in items:
         exists = "OK" if path.exists() else "MISSING"

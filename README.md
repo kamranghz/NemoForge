@@ -1,422 +1,345 @@
-# NemoForge — Agentic Reason-Act-Reflect Physics Pipeline
+# NemoForge — Agentic Reason-Act-Reflect Physics Correction
 
-**NemoForge** is a PhD research project that implements an agentic
-**Reason → Act → Reflect (RAR)** loop for robot scene placement inside
-NVIDIA Isaac Sim.  A language model proposes object placements; a PhysX
-physics simulation evaluates them; the model then reflects on the collision
-report and self-corrects, repeating until the scene is physically valid.
+**NemoForge** is a PhD research pipeline implementing an agentic
+**Reason → Act → Reflect (RAR)** loop for physics-based correction of
+3D scenes reconstructed from video (USD format).  A language model proposes
+geometry corrections; an ovphysx simulation evaluates physical validity;
+the model reflects on the failure report and self-corrects, repeating until
+the scene is simulation-ready.
 
-The project also includes a large-scale physics validity benchmark over the
-**SAGE-10k** dataset (10 000 indoor scenes, 325 GB) to measure how often
-automatically generated scenes are simulation-ready.
+The pipeline also includes a large-scale physics validity **SAGE-10k baseline**
+that measures how often automatically generated scenes pass a PhysX simulation
+out of the box.
+
+> **Branch:** `v2-clean-architecture` — flat `src/` layout, standalone ovphysx
+> (no Isaac Sim required to run the RAR loop or baseline).
 
 ---
 
 ## Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [Prerequisites](#2-prerequisites)
-3. [Project Structure](#3-project-structure)
-4. [How to Build / Setup](#4-how-to-build--setup)
-5. [How to Run the Main Test Loop](#5-how-to-run-the-main-test-loop)
-6. [How to Run the SAGE-10k Physics Baseline](#6-how-to-run-the-sage-10k-physics-baseline)
-7. [How to Launch Everything Inside Isaac Sim](#7-how-to-launch-everything-inside-isaac-sim)
-8. [Troubleshooting](#8-troubleshooting)
+1. [Architecture](#1-architecture)
+2. [Repository Structure](#2-repository-structure)
+3. [Prerequisites](#3-prerequisites)
+4. [Setup](#4-setup)
+5. [Running the Pipeline](#5-running-the-pipeline)
+6. [Reference Repositories](#6-reference-repositories)
+7. [Troubleshooting](#7-troubleshooting)
+8. [Citation](#8-citation)
+9. [License](#9-license)
 
 ---
 
-## 1. Project Overview
-
-### What is the RAR loop?
+## 1. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  User task: "Place the chair next to the table without overlap." │
+┌──────────────────────────────────────────────────────────────────┐
+│  Input: video-reconstructed USD scene                            │
 │                                                                  │
-│   REASON   →  build_prompt()  → structured LLM prompt           │
-│   ACT      →  FastAPI bridge  → NemoClaw agent (JSON placement)  │
-│   REFLECT  →  get_physics_report()  → PhysX contacts + stability │
-│               PhysicsReflector  → decide: continue or stop       │
-│               loop back to REASON with updated physics context   │
-└─────────────────────────────────────────────────────────────────┘
+│   REASON   → prompt_builder.py  → structured LLM prompt         │
+│   ACT      → nemoclaw_client.py → NemoClaw / NIM / Ollama       │
+│   REFLECT  → physics_critic.py  → ovphysx failure score         │
+│              correction_engine.py → loop until score < 0.5      │
+│                                                                  │
+│  Output: corrected USD + per-iteration correction record         │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-The loop runs up to **8 iterations** and stops early when two consecutive
-physics reports are clean (zero collisions, zero unstable objects).
+### Modules
 
-### What is the SAGE-10k benchmark?
-
-Each of the 10 000 scenes is stored as a `.zip` archive in `dataset/SAGE-10k/scenes/`.
-The baseline script unpacks each scene, converts it to USD using the official
-NVIDIA `kits/` conversion tools, loads it into Isaac Sim, runs a physics
-simulation, and records the initial validity metrics.
+| Module | File | Role |
+|--------|------|------|
+| **Simulation** | `src/simulation/physics_critic.py` | Runs ovphysx 0.4.9: 120 steps at 1/60 s, returns a `failure_score` |
+| **Agent** | `src/agent/nemoclaw_client.py` | LLM client: tries NemoClaw `:8642` → NVIDIA NIM → Ollama |
+| **Correction** | `src/correction/correction_engine.py` | Orchestrates RAR loop; stops when `failure_score < 0.5` |
+| **Correction** | `src/correction/prompt_builder.py` | Builds physics-aware LLM prompts from `PhysicsReport` |
+| **Benchmark** | `src/benchmark/sage_baseline.py` | SAGE-10k scene iterator → ovphysx → JSON output |
+| **API** | `src/api/bridge.py` | FastAPI `:8010` — `/health`, `/correct`, `/generate` |
+| **Utils** | `src/utils/paths.py` | Canonical path registry (`REPO_ROOT`, dataset, results) |
+| **Utils** | `src/utils/json_to_usd.py` | JSON scene → USD conversion helper |
 
 ---
 
-## 2. Prerequisites
+## 2. Repository Structure
+
+```
+NemoForge/
+├── src/
+│   ├── agent/
+│   │   └── nemoclaw_client.py      # LLM agent client
+│   ├── api/
+│   │   └── bridge.py               # FastAPI server (:8010)
+│   ├── benchmark/
+│   │   └── sage_baseline.py        # SAGE-10k physics baseline runner
+│   ├── correction/
+│   │   ├── correction_engine.py    # RAR loop orchestrator
+│   │   └── prompt_builder.py       # LLM prompt construction
+│   ├── simulation/
+│   │   └── physics_critic.py       # ovphysx physics evaluator
+│   └── utils/
+│       ├── paths.py                # Path registry
+│       └── json_to_usd.py          # JSON → USD conversion
+│
+├── pyproject.toml                  # Package metadata & dependencies
+├── README.md
+└── .gitignore
+
+# --- NOT in this repo --- set up locally as described below ---
+# dataset/SAGE-10k/               325 GB — download from Hugging Face
+# NemoClaw/                       NVIDIA NemoClaw agent (optional local)
+# isaacsim/                       Isaac Sim source / build (optional)
+# reference_repos/                Third-party research clones (optional)
+# results/                        Output CSV / JSON (git-ignored)
+```
+
+---
+
+## 3. Prerequisites
 
 ### Hardware
+
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | GPU | NVIDIA RTX (any) | RTX 4080 or higher |
 | RAM | 32 GB | 64 GB |
-| Disk | 50 GB (repo + build) | 400 GB (+ full SAGE-10k) |
+| Disk | 10 GB (repo + venv) | 400 GB (+ full SAGE-10k) |
 | VRAM | 8 GB | 16 GB+ |
 
-### Software (Windows 10/11)
-- **Git** and **Git LFS** (for the Isaac Sim submodule)
-- **Microsoft Visual Studio 2019 or 2022** with the
-  *Desktop development with C++* workload (required only to build Isaac Sim from source)
-- **Windows SDK** (installed alongside MSVC)
-- **NVIDIA GPU Driver** ≥ 537 (see [NVIDIA driver requirements](https://docs.omniverse.nvidia.com/dev-guide/latest/common/technical-requirements.html))
-- **Python 3.10+** (for the FastAPI bridge and standalone RAR loop)
-- **pip packages** for the bridge:
-  ```
-  pip install fastapi uvicorn requests pydantic
-  ```
+### Python
 
-### Isaac Sim Python
-All physics-related scripts **must** run with Isaac Sim's bundled Python
-(not Anaconda or system Python).  After building or installing Isaac Sim,
-the correct launcher is:
+Python **3.10** or higher (tested on 3.10 – 3.13).  Isaac Sim is **not** required
+to run the RAR loop or the SAGE baseline; ovphysx runs as a standalone Python
+package.
 
-```
-isaacsim\_build\windows-x86_64\release\python.bat   (built from source)
-%LOCALAPPDATA%\ov\pkg\isaac_sim-<version>\python.bat (Omniverse Launcher)
+### Python packages
+
+```bash
+pip install fastapi uvicorn[standard] requests pydantic numpy
+pip install ovphysx==0.4.9          # physics simulation (PyPI)
 ```
 
-The helper script `scripts\setup_isaac_paths.bat` finds this automatically.
+### LLM backend (choose one)
 
----
+| Option | Setup |
+|--------|-------|
+| **NemoClaw local** | Clone and start [NemoClaw](https://github.com/NVIDIA/NemoClaw); runs on `:8642` |
+| **NVIDIA NIM cloud** | Set `NVIDIA_API_KEY` env var; no local model needed |
+| **Ollama** | Install [Ollama](https://ollama.com), pull a model (e.g. `ollama pull llama3`) |
 
-## 3. Project Structure
+The agent client tries all three in order and falls back automatically.
+
+### SAGE-10k dataset (optional — 325 GB)
+
+Required only for the SAGE baseline, not the correction pipeline.
+
+```bash
+# Install Hugging Face CLI if needed
+pip install huggingface_hub
+
+# Authenticate
+huggingface-cli login --token YOUR_HF_TOKEN
+
+# Download (streams in parts — safe to resume)
+huggingface-cli download nvidia/SAGE-10k \
+    --repo-type dataset \
+    --local-dir dataset/SAGE-10k
+```
+
+Expected layout after download:
 
 ```
-C:\NemoForge\
-├── NemoClaw/                   # NemoClaw robot agent (do NOT move)
-├── isaac-sim-backend/          # FastAPI bridge — kept at repo root
-│   ├── main.py                 #   FastAPI app: /health /generate
-│   ├── prompt_builder.py       #   Builds RAR prompts
-│   ├── nemo_client.py          #   NemoClaw API client
-│   └── asset_resolver.py       #   Maps agent output to USD assets
-├── reference_repos/            # Third-party clones (do NOT move)
-├── dataset/                    # SAGE-10k dataset (git-ignored, 325 GB)
-│   └── SAGE-10k/
-│       ├── scenes/             #   *.zip scene archives
-│       └── kits/               #   Official NVIDIA conversion scripts
-├── isaacsim/                   # Isaac Sim cloned source tree (do NOT move)
-│   └── _build/windows-x86_64/release/
-│       ├── python.bat          #   <-- Isaac Sim Python launcher
-│       └── isaac-sim.bat       #   <-- Isaac Sim GUI launcher
-│
-├── src/
-│   └── nemoforge/              # Main Python package
-│       ├── agent/              #   LLM agent logic (future extension)
-│       ├── simulation/         #   Isaac Sim helpers (future extension)
-│       ├── bridge/             #   Thin wrapper over isaac-sim-backend
-│       ├── core/
-│       │   ├── test_loop.py            # RAR orchestrator (main entry point)
-│       │   ├── sage_10k_physic_test.py # SAGE-10k physics baseline
-│       │   └── nf_core_50.json         # 50 benchmark tasks
-│       └── utils/
-│           ├── paths.py                # Central path registry
-│           └── verify_sage_structure.py
-│
-├── scripts/                    # Windows launcher scripts (operational)
-│   ├── run_test_loop.bat               # Launch RAR test loop
-│   ├── run_sage_physics_test.bat       # Launch SAGE-10k baseline
-│   ├── setup_isaac_paths.bat           # Auto-detect Isaac Sim Python
-│   └── build_isaacsim.bat              # Build Isaac Sim from source
-│
-├── config/                     # YAML / JSON config overrides (future)
-├── docs/                       # Research documentation
-├── results/                    # Output CSV / JSON (git-ignored)
-├── pyproject.toml              # Package metadata and dev dependencies
-├── .gitignore
-└── README.md
+dataset/SAGE-10k/
+├── scenes/       # *.zip archives (~10 000 scenes)
+└── kits/         # NVIDIA USD conversion scripts
 ```
 
 ---
 
-## 4. How to Build / Setup
+## 4. Setup
 
-### Step 1 — Clone and initialise
+```bash
+# 1. Clone this repo
+git clone https://github.com/<your-org>/NemoForge.git
+cd NemoForge
 
-```bat
-git clone <this-repo> C:\NemoForge
-cd C:\NemoForge
-git lfs install
-git lfs pull
+# 2. Install Python dependencies
+pip install -e ".[dev]"       # installs fastapi, uvicorn, requests, pydantic
+pip install ovphysx==0.4.9    # physics engine (not in pyproject.toml — GPU wheel)
+
+# 3. Set PYTHONPATH so all src/ packages are importable
+#    PowerShell:
+$env:PYTHONPATH = "$PWD\src"
+#    bash / zsh:
+export PYTHONPATH="$PWD/src"
+
+# 4. (Optional) Set LLM credentials
+$env:NVIDIA_API_KEY = "nvapi-..."
 ```
 
-### Step 2 — Install Python dependencies for the FastAPI bridge
+Verify the path registry resolves:
 
-```bat
-cd C:\NemoForge\isaac-sim-backend
-pip install -r requirements.txt
-```
-
-### Step 3a — Build Isaac Sim from source (if not using Omniverse Launcher)
-
-> This takes 20–40 minutes and requires Visual Studio with C++ tools.
-
-```bat
-cd C:\NemoForge
-scripts\build_isaacsim.bat
-```
-
-After a successful build, the Isaac Sim Python launcher will be at:
-`isaacsim\_build\windows-x86_64\release\python.bat`
-
-### Step 3b — Alternatively, install Isaac Sim via Omniverse Launcher
-
-1. Download and install the [Omniverse Launcher](https://www.nvidia.com/en-us/omniverse/).
-2. In the launcher, install **Isaac Sim** (any 4.x or 5.x version).
-3. `scripts\setup_isaac_paths.bat` will find it automatically under `%LOCALAPPDATA%\ov\pkg\`.
-
-### Step 4 — Verify all paths resolve
-
-```bat
-python src\nemoforge\utils\paths.py
-```
-
-Expected output: all entries show `[OK]`.
-
-### Step 5 — Download the SAGE-10k dataset (optional — 325 GB)
-
-```bat
-:: Login with your Hugging Face token
-%CONDA_PREFIX%\Scripts\hf.exe auth login --token YOUR_HF_TOKEN
-
-:: Download the full dataset
-%CONDA_PREFIX%\Scripts\hf.exe download nvidia/SAGE-10k ^
-    --repo-type dataset ^
-    --local-dir C:\NemoForge\dataset\SAGE-10k
+```bash
+python src/utils/paths.py
 ```
 
 ---
 
-## 5. How to Run the Main Test Loop
+## 5. Running the Pipeline
 
-### Start the FastAPI bridge first (Terminal 1)
+### 5a. RAR correction loop — single USD scene
 
-The RAR loop requires the bridge to be running before any test is started.
-
-```bat
-cd C:\NemoForge\isaac-sim-backend
-uvicorn main:app --host 127.0.0.1 --port 8010 --reload
+```bash
+python src/correction/correction_engine.py \
+    --usd path/to/scene.usd \
+    --scene-id my_scene_001
 ```
 
-Verify it is healthy:
-```bat
-curl http://127.0.0.1:8010/health
+The loop stops when `failure_score < 0.5` or after 8 iterations.
+Results are written to `results/correction_results.csv`.
+
+### 5b. SAGE-10k physics baseline
+
+```bash
+python src/benchmark/sage_baseline.py \
+    --mode baseline \
+    --n-scenes 10 \
+    --seed 42
 ```
 
-### Run a single task (Terminal 2)
-
-```bat
-:: Using Isaac Sim Python (full extension support)
-scripts\run_test_loop.bat
-
-:: OR with plain Python (RAR logic only, no live physics)
-python src\nemoforge\core\test_loop.py
-```
-
-### Run the full NF-Core benchmark (50 tasks)
-
-```bat
-:: Headless — fast, no GUI, logs only
-scripts\run_test_loop.bat --batch --headless
-
-:: With Isaac Sim viewport and HUD overlay visible
-scripts\run_test_loop.bat --batch
-
-:: Save one viewport screenshot per iteration per task
-scripts\run_test_loop.bat --batch --visuals
-
-:: Custom task file and output directory
-scripts\run_test_loop.bat --batch --task-file config\my_tasks.json --results-dir D:\output
-```
-
-### Output
-
-| File | Contents |
-|------|----------|
-| `results/benchmark_report.csv` | Per-task: task ID, category, iterations, success, collision counts |
-| `results/visuals/NF_<TaskID>_Iter<N>.png` | Viewport screenshots (only with `--visuals`) |
-
----
-
-## 6. How to Run the SAGE-10k Physics Baseline
-
-This test requires the full SAGE-10k dataset and Isaac Sim Python.
-
-```bat
-:: Default: 10 random scenes, seed 42, headless
-scripts\run_sage_physics_test.bat
-
-:: More scenes, keep extracted files for inspection
-scripts\run_sage_physics_test.bat --n-scenes 50 --keep-extract
-
-:: Force re-conversion from layout JSON (ignore USD cache)
-scripts\run_sage_physics_test.bat --force-export
-
-:: With Isaac Sim viewport visible
-scripts\run_sage_physics_test.bat --n-scenes 5
-```
-
-### Output
+Output: `results/sage_validity_baseline.json`
 
 ```json
-// results/sage_validity_baseline.json
 {
-  "metadata": { "n_scenes": 10, "data_root": "C:\\NemoForge\\dataset\\SAGE-10k" },
+  "metadata": { "n_scenes": 10, "data_root": "dataset/SAGE-10k" },
   "records": [
     {
-      "scene_zip":          "20251213_020526_layout_84b703fb.zip",
-      "usd_path_used":      "results/sage_usd_cache/.../sage_composed.usd",
-      "initial_collisions": 0,
-      "unstable_count":     0,
-      "max_penetration_cm": 0.0,
-      "validity":           "PASS",
-      "error":              null
+      "scene_zip":     "20251213_020526_layout_84b703fb.zip",
+      "failure_score": 0.12,
+      "validity":      "PASS",
+      "error":         null
     }
   ]
 }
 ```
 
----
+### 5c. FastAPI bridge (standalone server)
 
-## 7. How to Launch Everything Inside Isaac Sim
-
-### Using Isaac Sim Python (recommended for physics tests)
-
-```bat
-:: Verify the launcher path is found
-call scripts\setup_isaac_paths.bat
-echo %ISAAC_PY%
-
-:: Run any script with the Isaac Python environment
-"%ISAAC_PY%" src\nemoforge\core\sage_10k_physic_test.py --headless
-
-:: Or use the helper batch files (they call setup_isaac_paths.bat automatically)
-scripts\run_sage_physics_test.bat --headless
+```bash
+python src/api/bridge.py
+# or
+uvicorn api.bridge:app --host 0.0.0.0 --port 8010 --reload
 ```
 
-### Using the Isaac Sim GUI (for interactive debugging)
+Endpoints:
 
-```bat
-:: Launch Isaac Sim with a visible viewport
-isaacsim\_build\windows-x86_64\release\isaac-sim.bat
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/correct` | Run RAR correction on a USD path |
+| `POST` | `/generate` | Single LLM placement call |
 
-In the Isaac Sim GUI, open the Script Editor and run:
-```python
-exec(open(r"C:\NemoForge\src\nemoforge\core\test_loop.py").read())
-```
+### 5d. All three options require PYTHONPATH
 
-### Warm up shader cache (first run only — reduces startup time)
+Always export `PYTHONPATH` before running any `src/` script directly:
 
-```bat
-isaacsim\_build\windows-x86_64\release\warmup.bat
+```powershell
+# PowerShell — one-liner
+$env:PYTHONPATH = "C:\NemoPhys\NemoForge\src"; python src/correction/correction_engine.py ...
 ```
 
 ---
 
-## 8. Troubleshooting
+## 6. Reference Repositories
 
-### "Could not import SimulationApp"
+The following repositories were used as research references.
+They are **not** required to run NemoForge but are listed here for reproducibility.
+Clone them locally if you want to read or compare their implementations.
 
-**Cause:** The script is being run with plain Python (Anaconda, system Python) instead
-of Isaac Sim's bundled Python.
-
-**Fix:**
-1. Check that `scripts\setup_isaac_paths.bat` prints `[setup] Isaac Sim Python found`.
-2. Use `scripts\run_sage_physics_test.bat` instead of calling `python` directly.
-3. If using the Omniverse Launcher install, verify the path:
-   ```bat
-   dir "%LOCALAPPDATA%\ov\pkg\isaac_sim-*\python.bat"
-   ```
-4. If using a repo build, verify the build completed:
-   ```bat
-   dir isaacsim\_build\windows-x86_64\release\python.bat
-   ```
+| Repo | URL | Purpose |
+|------|-----|---------|
+| SAGE | https://github.com/NVIDIA/SAGE | Scene generation benchmark + kits |
+| GenManip | https://github.com/GenManip/GenManip | Manipulation scene generation |
+| SceneWeaver | — | 3D scene composition reference |
+| NemoClaw | https://github.com/NVIDIA/NemoClaw | NVIDIA agentic robot framework |
 
 ---
 
-### "ModuleNotFoundError: No module named 'omni.usd'"
+## 7. Troubleshooting
 
-**Cause:** Isaac Sim Python was found but the Kit session is not yet initialised.
+### `ModuleNotFoundError: No module named 'simulation'`
 
-**Fix:** The physics test scripts call `SimulationApp({"headless": True})` automatically.
-If you are running interactively, make sure you are inside an active Kit session.
+`src/` is not on `PYTHONPATH`.  Export it first:
 
----
-
-### "FATAL: cannot import extension"
-
-**Cause:** `src/nemoforge/utils/paths.py` did not register the extension directory on `sys.path`,
-or the NemoClaw connector has not been built.
-
-**Fix:**
-```bat
-:: Check all paths are valid
-python src\nemoforge\utils\paths.py
-
-:: Confirm extension.py exists
-dir isaacsim\source\extensions\isaacsim.nemoclaw.connector\isaacsim\nemoclaw\connector\extension.py
+```powershell
+$env:PYTHONPATH = "C:\NemoPhys\NemoForge\src"
 ```
 
 ---
 
-### "FastAPI bridge did not respond" / "BRIDGE_ERROR"
+### `ModuleNotFoundError: No module named 'ovphysx'`
 
-**Cause:** The FastAPI bridge is not running when `test_loop.py` makes its request.
+Install the GPU wheel:
 
-**Fix:** Start the bridge in a separate terminal *before* running the test loop:
-```bat
-cd isaac-sim-backend
-uvicorn main:app --port 8010
+```bash
+pip install ovphysx==0.4.9
 ```
 
-Confirm it is healthy:
-```bat
-curl http://127.0.0.1:8010/health
+If the package is not yet on PyPI in your environment, check the
+[NVIDIA developer portal](https://developer.nvidia.com) for the correct wheel URL.
+
+---
+
+### `ConnectionRefusedError` from `nemoclaw_client.py`
+
+The client tries NemoClaw (`:8642`) first.  If no local agent is running it
+automatically falls back to NVIDIA NIM (requires `NVIDIA_API_KEY`) then Ollama.
+If all three fail, set at least one of:
+
+```powershell
+$env:NVIDIA_API_KEY = "nvapi-..."   # NIM cloud
+# or start Ollama:  ollama serve
 ```
 
 ---
 
-### `huggingface-cli` not found on Windows
+### `FileNotFoundError: dataset/SAGE-10k/scenes`
 
-The newer `huggingface_hub` package installs `hf.exe`, not `huggingface-cli.exe`.
-Use the correct launcher for your environment:
+The SAGE-10k dataset has not been downloaded.  See [Prerequisites](#3-prerequisites).
 
-```bat
-:: Conda (care-ai) environment
-%CONDA_PREFIX%\Scripts\hf.exe download nvidia/SAGE-10k ...
+---
 
-:: Or via Python module
+### `huggingface-cli not found`
+
+```bash
+pip install huggingface_hub
 python -m huggingface_hub.commands.huggingface_cli download nvidia/SAGE-10k ...
 ```
 
 ---
 
-### Unicode / encoding errors in PowerShell
+### Isaac Sim / NemoClaw extension (`extension.py`)
 
-Isaac Sim's `python.bat` uses the Windows code page (cp1252).
-This project has replaced all non-ASCII characters (arrows, emoji) in batch-facing
-code.  If you add new code, avoid Unicode characters in strings that reach the terminal.
+`isaacsim/source/extensions/isaacsim.nemoclaw.connector/` contains a
+1700-line Kit extension for interactive Isaac Sim use.  It is **not** required
+for the v2 Python pipeline.  If you need it:
+
+1. Install Isaac Sim via the [Omniverse Launcher](https://www.nvidia.com/en-us/omniverse/)
+   or build from source.
+2. Set `ISAAC_SIM_PATH` and run with Isaac Sim Python:
+   ```bat
+   isaacsim\_build\windows-x86_64\release\python.bat src/...
+   ```
 
 ---
 
-## Citation
+## 8. Citation
 
-If you use NemoForge or the SAGE-10k benchmark in your research, please cite:
+If you use NemoForge or the SAGE-10k benchmark results in your research, please cite:
 
 ```bibtex
 @article{xia2026sage,
   title   = {SAGE: Scalable Agentic 3D Scene Generation for Embodied AI},
-  author  = {Xia, Hongchi and Li, Xuan and ...},
+  author  = {Xia, Hongchi and Li, Xuan and others},
   journal = {arXiv preprint arXiv:2602.10116},
   year    = {2026}
 }
@@ -424,7 +347,7 @@ If you use NemoForge or the SAGE-10k benchmark in your research, please cite:
 
 ---
 
-## License
+## 9. License
 
 This project is released under the **Apache License 2.0**.
 See `NemoClaw/LICENSE` and `dataset/SAGE-10k/README.md` for third-party terms.
