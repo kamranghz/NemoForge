@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Isaac Sim build artefacts (tracked separately)
+isaacsim/_build/
+isaacsim/_compiler/
+isaacsim/_repo/
+
+# Results & generated outputs
+results/
+generated-assets/
+
+# Dataset (325 GB — never commit)
+dataset/
+
+# Secrets / tokens
+*.env
+.env.*
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Node (NemoClaw sub-project)
+NemoClaw/node_modules/
+
+# Misc
+*.bak
+package-lock.json

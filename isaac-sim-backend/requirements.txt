@@ -1,0 +1,5 @@
+# Isaac Sim NemoClaw Bridge — Windows dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+requests>=2.28.0
