@@ -6,8 +6,6 @@ NemoForge implements an agentic **Reason → Act → Reflect (RAR)** loop that a
 
 The pipeline also includes a large-scale physics validity **SAGE-10K baseline** that measures how often automatically generated scenes pass a PhysX simulation without manual correction.
 
-> **Branch:** `v2-clean-architecture` — flat `src/` layout, standalone ovphysx. Isaac Sim is not required to run the RAR loop or the SAGE baseline.
-
 ---
 
 ## Table of Contents
