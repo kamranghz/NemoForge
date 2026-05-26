@@ -1,66 +1,99 @@
-# NemoForge — Agentic Reason-Act-Reflect Physics Correction
+# NemoForge
 
-**NemoForge** is a PhD research pipeline implementing an agentic
-**Reason → Act → Reflect (RAR)** loop for physics-based correction of
-3D scenes reconstructed from video (USD format).  A language model proposes
-geometry corrections; an ovphysx simulation evaluates physical validity;
-the model reflects on the failure report and self-corrects, repeating until
-the scene is simulation-ready.
+**Agentic physics correction of video-reconstructed 3D scenes using LLM reasoning and PhysX simulation**
 
-The pipeline also includes a large-scale physics validity **SAGE-10k baseline**
-that measures how often automatically generated scenes pass a PhysX simulation
-out of the box.
+NemoForge implements an agentic **Reason → Act → Reflect (RAR)** loop that automatically corrects physics violations in 3D scenes reconstructed from video. A language model proposes geometry corrections, an ovphysx simulation evaluates physical validity, and the model reflects on the failure report and self-corrects — repeating until the scene is simulation-ready.
 
-> **Branch:** `v2-clean-architecture` — flat `src/` layout, standalone ovphysx
-> (no Isaac Sim required to run the RAR loop or baseline).
+The pipeline also includes a large-scale physics validity **SAGE-10K baseline** that measures how often automatically generated scenes pass a PhysX simulation without manual correction.
+
+> **Branch:** `v2-clean-architecture` — flat `src/` layout, standalone ovphysx. Isaac Sim is not required to run the RAR loop or the SAGE baseline.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture](#1-architecture)
-2. [Repository Structure](#2-repository-structure)
-3. [Prerequisites](#3-prerequisites)
-4. [Setup](#4-setup)
-5. [Running the Pipeline](#5-running-the-pipeline)
-6. [Reference Repositories](#6-reference-repositories)
-7. [Troubleshooting](#7-troubleshooting)
-8. [Citation](#8-citation)
-9. [License](#9-license)
+1. [The Problem](#1-the-problem)
+2. [Architecture](#2-architecture)
+3. [Repository Structure](#3-repository-structure)
+4. [Prerequisites](#4-prerequisites)
+5. [Setup](#5-setup)
+6. [Running the Pipeline](#6-running-the-pipeline)
+7. [Reference Repositories](#7-reference-repositories)
+8. [Troubleshooting](#8-troubleshooting)
 
 ---
 
-## 1. Architecture
+## 1. The Problem
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  Input: video-reconstructed USD scene                            │
-│                                                                  │
-│   REASON   → prompt_builder.py  → structured LLM prompt         │
-│   ACT      → nemoclaw_client.py → NemoClaw / NIM / Ollama       │
-│   REFLECT  → physics_critic.py  → ovphysx failure score         │
-│              correction_engine.py → loop until score < 0.5      │
-│                                                                  │
-│  Output: corrected USD + per-iteration correction record         │
-└──────────────────────────────────────────────────────────────────┘
-```
+Neural reconstruction methods such as DUSt3R, MASt3R, and VGGT produce visually accurate scenes but cannot guarantee physical validity. Reconstructed scenes frequently contain:
 
-### Modules
+- **Floating objects** — caused by depth uncertainty during reconstruction
+- **Interpenetrating geometry** — from incomplete multi-view coverage
+- **Non-manifold surfaces** — from mesh extraction artifacts
 
-| Module | File | Role |
-|--------|------|------|
-| **Simulation** | `src/simulation/physics_critic.py` | Runs ovphysx 0.4.9: 120 steps at 1/60 s, returns a `failure_score` |
-| **Agent** | `src/agent/nemoclaw_client.py` | LLM client: tries NemoClaw `:8642` → NVIDIA NIM → Ollama |
-| **Correction** | `src/correction/correction_engine.py` | Orchestrates RAR loop; stops when `failure_score < 0.5` |
-| **Correction** | `src/correction/prompt_builder.py` | Builds physics-aware LLM prompts from `PhysicsReport` |
-| **Benchmark** | `src/benchmark/sage_baseline.py` | SAGE-10k scene iterator → ovphysx → JSON output |
-| **API** | `src/api/bridge.py` | FastAPI `:8010` — `/health`, `/correct`, `/generate` |
-| **Utils** | `src/utils/paths.py` | Canonical path registry (`REPO_ROOT`, dataset, results) |
-| **Utils** | `src/utils/json_to_usd.py` | JSON scene → USD conversion helper |
+These violations are invisible to photometric metrics (PSNR, SSIM) but catastrophic in physics simulation. Manual correction takes tens of engineering hours per scene. NemoForge automates this process.
 
 ---
 
-## 2. Repository Structure
+## 2. Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         NemoForge Pipeline                           │
+│                                                                       │
+│  Input: video-reconstructed USD scene (with physics violations)      │
+│                                                                       │
+│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐  │
+│  │    REASON    │ →  │     ACT      │ →  │       REFLECT         │  │
+│  │              │    │              │    │                       │  │
+│  │ prompt       │    │ NemoClaw     │    │  ovphysx PhysX sim    │  │
+│  │ builder      │    │ NIM cloud    │    │  failure score F      │  │
+│  │              │    │ Ollama       │    │  violation report     │  │
+│  └──────────────┘    └──────────────┘    └──────────┬────────────┘  │
+│         ↑                                            │               │
+│         └──────────── action history ────────────────┘               │
+│                                                                       │
+│  Stops when:  F < 0.5  OR  max iterations reached                    │
+│                                                                       │
+│  Output: corrected USD · correction log · RFPCR metric               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Physics Failure Score
+
+$$\mathcal{F}(S_t) = \sum_{(i,j)} d_{ij} + 2.0\,\sum_i h_i + 0.5\,\sum_i v_i + \eta$$
+
+| Term | Symbol | Source |
+|------|--------|--------|
+| Penetration depth | $d_{ij}$ | Contact report |
+| Floating offset | $h_i$ | Position tensor — Y axis |
+| Post-settle velocity | $v_i$ | Velocity tensor |
+| Non-manifold ratio | $\eta$ | Mesh topology |
+
+### Evaluation Metric — RFPCR
+
+**Reconstructed-scene Physics Correction Rate** measures whether a corrected scene is both physically valid and visually similar to the original reconstruction:
+
+$$\text{RFPCR} = \frac{1}{N} \sum_{n=1}^{N} \mathbf{1}\!\left[\, \mathcal{F}(S^*_n) < \varepsilon \;\wedge\; \text{SSIM}(S^*_n,\,S_n) > 1 - \delta \,\right]$$
+
+### Module Reference
+
+| Module | File | Responsibility |
+|--------|------|----------------|
+| **Physics Critic** | `simulation/physics_critic.py` | Loads USD, settles 120 PhysX steps at 1/60 s, returns `failure_score` and violation breakdown |
+| **LLM Agent** | `agent/nemoclaw_client.py` | Queries NemoClaw local `:8642` → NVIDIA NIM cloud → Ollama `:11434` in priority order |
+| **Correction Engine** | `correction/correction_engine.py` | Orchestrates the RAR loop with rollback, per-iteration logging, and CSV output |
+| **Prompt Builder** | `correction/prompt_builder.py` | Builds structured correction prompts from `PhysicsReport` with full action history |
+| **SAGE Benchmark** | `benchmark/sage_baseline.py` | Extracts SAGE-10K zips, converts to USD, runs physics measurement in batch |
+| **API Bridge** | `api/bridge.py` | FastAPI server — `/health`, `/correct`, `/generate` |
+| **Path Registry** | `utils/paths.py` | Central path definitions for all local dependencies |
+| **USD Converter** | `utils/json_to_usd.py` | Converts SAGE layout JSON to physics-ready USD |
+
+---
+
+## 3. Repository Structure
+
+### What is on GitHub
 
 ```
 NemoForge/
@@ -70,7 +103,7 @@ NemoForge/
 │   ├── api/
 │   │   └── bridge.py               # FastAPI server (:8010)
 │   ├── benchmark/
-│   │   └── sage_baseline.py        # SAGE-10k physics baseline runner
+│   │   └── sage_baseline.py        # SAGE-10K physics baseline runner
 │   ├── correction/
 │   │   ├── correction_engine.py    # RAR loop orchestrator
 │   │   └── prompt_builder.py       # LLM prompt construction
@@ -78,23 +111,30 @@ NemoForge/
 │   │   └── physics_critic.py       # ovphysx physics evaluator
 │   └── utils/
 │       ├── paths.py                # Path registry
-│       └── json_to_usd.py          # JSON → USD conversion
-│
-├── pyproject.toml                  # Package metadata & dependencies
+│       ├── json_to_usd.py          # JSON → USD conversion
+│       └── verify_sage_structure.py
+├── pyproject.toml
 ├── README.md
 └── .gitignore
+```
 
-# --- NOT in this repo --- set up locally as described below ---
-# dataset/SAGE-10k/               325 GB — download from Hugging Face
-# NemoClaw/                       NVIDIA NemoClaw agent (optional local)
-# isaacsim/                       Isaac Sim source / build (optional)
-# reference_repos/                Third-party research clones (optional)
-# results/                        Output CSV / JSON (git-ignored)
+### What you create locally (not committed)
+
+```
+NemoForge/
+├── dataset/
+│   └── SAGE-10k/           # ~325 GB — download from Hugging Face
+│       ├── scenes/          # *.zip scene archives
+│       └── kits/            # NVIDIA USD conversion scripts
+├── NemoClaw/                # NVIDIA NemoClaw agent (optional)
+├── isaacsim/                # Isaac Sim source (optional)
+├── reference_repos/         # Research reference clones (optional)
+└── results/                 # CSV / JSON outputs (git-ignored)
 ```
 
 ---
 
-## 3. Prerequisites
+## 4. Prerequisites
 
 ### Hardware
 
@@ -102,252 +142,215 @@ NemoForge/
 |-----------|---------|-------------|
 | GPU | NVIDIA RTX (any) | RTX 4080 or higher |
 | RAM | 32 GB | 64 GB |
-| Disk | 10 GB (repo + venv) | 400 GB (+ full SAGE-10k) |
+| Disk | 10 GB (repo + venv) | 400 GB (+ full SAGE-10K) |
 | VRAM | 8 GB | 16 GB+ |
 
 ### Python
 
-Python **3.10** or higher (tested on 3.10 – 3.13).  Isaac Sim is **not** required
-to run the RAR loop or the SAGE baseline; ovphysx runs as a standalone Python
-package.
+Python **3.10** or higher. Isaac Sim is **not** required to run the RAR loop or the SAGE baseline — ovphysx runs as a standalone Python package.
 
 ### Python packages
 
 ```bash
-pip install fastapi uvicorn[standard] requests pydantic numpy
-pip install ovphysx==0.4.9          # physics simulation (PyPI)
+pip install -e ".[dev]"
+pip install numpy "ovphysx==0.4.9" --extra-index-url https://pypi.nvidia.com
 ```
 
-### LLM backend (choose one)
+### LLM backend — choose one
 
 | Option | Setup |
 |--------|-------|
-| **NemoClaw local** | Clone and start [NemoClaw](https://github.com/NVIDIA/NemoClaw); runs on `:8642` |
-| **NVIDIA NIM cloud** | Set `NVIDIA_API_KEY` env var; no local model needed |
-| **Ollama** | Install [Ollama](https://ollama.com), pull a model (e.g. `ollama pull llama3`) |
+| **NemoClaw local** | Clone [NemoClaw](https://github.com/NVIDIA/NemoClaw) and start it — runs on port **8642** |
+| **NVIDIA NIM cloud** | Set `NVIDIA_API_KEY` environment variable — no local model required |
+| **Ollama local** | Install [Ollama](https://ollama.com), run `ollama serve`, pull a model |
 
-The agent client tries all three in order and falls back automatically.
+The agent client probes all three in priority order and falls back automatically.
 
-### SAGE-10k dataset (optional — 325 GB)
+### SAGE-10K dataset (optional — 325 GB)
 
-Required only for the SAGE baseline, not the correction pipeline.
+Required only for the SAGE baseline.
 
 ```bash
-# Install Hugging Face CLI if needed
 pip install huggingface_hub
-
-# Authenticate
 huggingface-cli login --token YOUR_HF_TOKEN
 
-# Download (streams in parts — safe to resume)
 huggingface-cli download nvidia/SAGE-10k \
     --repo-type dataset \
     --local-dir dataset/SAGE-10k
 ```
 
-Expected layout after download:
-
-```
-dataset/SAGE-10k/
-├── scenes/       # *.zip archives (~10 000 scenes)
-└── kits/         # NVIDIA USD conversion scripts
-```
-
 ---
 
-## 4. Setup
+## 5. Setup
 
 ```bash
-# 1. Clone this repo
-git clone https://github.com/<your-org>/NemoForge.git
+# 1. Clone
+git clone https://github.com/kamranghz/NemoForge.git
 cd NemoForge
 
-# 2. Install Python dependencies
-pip install -e ".[dev]"       # installs fastapi, uvicorn, requests, pydantic
-pip install ovphysx==0.4.9    # physics engine (not in pyproject.toml — GPU wheel)
+# 2. Install dependencies
+pip install -e ".[dev]"
+pip install numpy "ovphysx==0.4.9" --extra-index-url https://pypi.nvidia.com
 
-# 3. Set PYTHONPATH so all src/ packages are importable
-#    PowerShell:
-$env:PYTHONPATH = "$PWD\src"
-#    bash / zsh:
+# 3. Set PYTHONPATH
+# Linux / WSL / macOS
 export PYTHONPATH="$PWD/src"
 
-# 4. (Optional) Set LLM credentials
-$env:NVIDIA_API_KEY = "nvapi-..."
-```
+# Windows PowerShell
+$env:PYTHONPATH = "$PWD\src"
 
-Verify the path registry resolves:
+# 4. Set NVIDIA API key (for cloud inference)
+export NVIDIA_API_KEY="nvapi-your-key-here"
 
-```bash
+# 5. Verify
 python src/utils/paths.py
 ```
 
 ---
 
-## 5. Running the Pipeline
+## 6. Running the Pipeline
 
-### 5a. RAR correction loop — single USD scene
+> **Always set `PYTHONPATH` before running any script.**
+
+### Physics measurement — single scene
+
+```bash
+python src/simulation/physics_critic.py path/to/scene.usd
+```
+
+Output:
+
+```
+========================================================
+  PHYSICS MEASUREMENT REPORT
+========================================================
+  Objects found     : 59
+  Penetration pairs : 4
+  Floating objects  : 54
+  Unstable objects  : 0
+  Failure score F   : 88.5200
+========================================================
+```
+
+### RAR correction loop — single USD scene
 
 ```bash
 python src/correction/correction_engine.py \
     --usd path/to/scene.usd \
-    --scene-id my_scene_001
+    --scene-id scene_001 \
+    --max-iter 10
 ```
 
-The loop stops when `failure_score < 0.5` or after 8 iterations.
-Results are written to `results/correction_results.csv`.
+Stops when `failure_score < 0.5` or after `--max-iter` iterations.
 
-### 5b. SAGE-10k physics baseline
+Output files:
+
+| File | Contents |
+|------|---------|
+| `results/correction_results.csv` | Per-scene summary — initial F, final F, RFPCR, iterations |
+| `results/correction_logs/scene_001.json` | Per-iteration action, F score, rollback status |
+
+### SAGE-10K physics baseline
 
 ```bash
+# Measure initial violations on 10 scenes
 python src/benchmark/sage_baseline.py \
     --mode baseline \
     --n-scenes 10 \
     --seed 42
+
+# Run full correction on 5 scenes
+python src/benchmark/sage_baseline.py \
+    --mode correction \
+    --n-scenes 5 \
+    --seed 42
 ```
 
-Output: `results/sage_validity_baseline.json`
+Output: `results/sage_baseline.csv`
 
-```json
-{
-  "metadata": { "n_scenes": 10, "data_root": "dataset/SAGE-10k" },
-  "records": [
-    {
-      "scene_zip":     "20251213_020526_layout_84b703fb.zip",
-      "failure_score": 0.12,
-      "validity":      "PASS",
-      "error":         null
-    }
-  ]
-}
-```
-
-### 5c. FastAPI bridge (standalone server)
+### Start the API bridge
 
 ```bash
 python src/api/bridge.py
 # or
-uvicorn api.bridge:app --host 0.0.0.0 --port 8010 --reload
+uvicorn api.bridge:app --host 127.0.0.1 --port 8010 --reload
 ```
 
-Endpoints:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness check |
-| `POST` | `/correct` | Run RAR correction on a USD path |
-| `POST` | `/generate` | Single LLM placement call |
-
-### 5d. All three options require PYTHONPATH
-
-Always export `PYTHONPATH` before running any `src/` script directly:
-
-```powershell
-# PowerShell — one-liner
-$env:PYTHONPATH = "C:\NemoPhys\NemoForge\src"; python src/correction/correction_engine.py ...
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Liveness check + active LLM backend |
+| `POST` | `/correct` | Physics report → correction action |
+| `POST` | `/generate` | Raw LLM call |
 
 ---
 
-## 6. Reference Repositories
+## 7. Reference Repositories
 
-The following repositories were used as research references.
-They are **not** required to run NemoForge but are listed here for reproducibility.
-Clone them locally if you want to read or compare their implementations.
+The following repositories were used as research references during development. They are not required to run NemoForge.
 
-| Repo | URL | Purpose |
-|------|-----|---------|
-| SAGE | https://github.com/NVIDIA/SAGE | Scene generation benchmark + kits |
-| GenManip | https://github.com/GenManip/GenManip | Manipulation scene generation |
-| SceneWeaver | — | 3D scene composition reference |
-| NemoClaw | https://github.com/NVIDIA/NemoClaw | NVIDIA agentic robot framework |
+| Repository | URL |
+|------------|-----|
+| SAGE | https://github.com/NVIDIA-Omniverse/SAGE |
+| NemoClaw | https://github.com/NVIDIA/NemoClaw |
+| Isaac Sim | https://github.com/isaac-sim/IsaacSim |
+| GenManip | https://github.com/GenManip/GenManip |
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
-### `ModuleNotFoundError: No module named 'simulation'`
+**`ModuleNotFoundError: No module named 'simulation'`**
 
-`src/` is not on `PYTHONPATH`.  Export it first:
-
-```powershell
-$env:PYTHONPATH = "C:\NemoPhys\NemoForge\src"
+`src/` is not on `PYTHONPATH`:
+```bash
+export PYTHONPATH="$PWD/src"
 ```
 
 ---
 
-### `ModuleNotFoundError: No module named 'ovphysx'`
-
-Install the GPU wheel:
+**`ModuleNotFoundError: No module named 'ovphysx'`**
 
 ```bash
-pip install ovphysx==0.4.9
-```
-
-If the package is not yet on PyPI in your environment, check the
-[NVIDIA developer portal](https://developer.nvidia.com) for the correct wheel URL.
-
----
-
-### `ConnectionRefusedError` from `nemoclaw_client.py`
-
-The client tries NemoClaw (`:8642`) first.  If no local agent is running it
-automatically falls back to NVIDIA NIM (requires `NVIDIA_API_KEY`) then Ollama.
-If all three fail, set at least one of:
-
-```powershell
-$env:NVIDIA_API_KEY = "nvapi-..."   # NIM cloud
-# or start Ollama:  ollama serve
+pip install "ovphysx==0.4.9" --extra-index-url https://pypi.nvidia.com
 ```
 
 ---
 
-### `FileNotFoundError: dataset/SAGE-10k/scenes`
+**`RuntimeError: No LLM backend available`**
 
-The SAGE-10k dataset has not been downloaded.  See [Prerequisites](#3-prerequisites).
+Start at least one backend:
+```bash
+# Option 1 — Ollama
+ollama serve && ollama pull llama3
+
+# Option 2 — NVIDIA NIM cloud
+export NVIDIA_API_KEY="nvapi-..."
+```
 
 ---
 
-### `huggingface-cli not found`
+**`No scenes found in dataset/SAGE-10k/scenes`**
+
+Download the dataset — see [Prerequisites](#4-prerequisites).
+
+---
+
+**`PhysX warning: cuCtxGetDevice failed`**
+
+ovphysx falls back to CPU simulation. This is normal in WSL2. Physics results remain valid.
+
+---
+
+**`Could not import SimulationApp` / `No module named 'omni'`**
+
+You are running an Isaac-specific script with plain Python. The core pipeline (`correction_engine.py`, `sage_baseline.py`) does not require Isaac Sim.
+
+---
+
+**`huggingface-cli not found`**
 
 ```bash
 pip install huggingface_hub
-python -m huggingface_hub.commands.huggingface_cli download nvidia/SAGE-10k ...
+python -m huggingface_hub.commands.huggingface_cli download nvidia/SAGE-10k \
+    --repo-type dataset --local-dir dataset/SAGE-10k
 ```
-
----
-
-### Isaac Sim / NemoClaw extension (`extension.py`)
-
-`isaacsim/source/extensions/isaacsim.nemoclaw.connector/` contains a
-1700-line Kit extension for interactive Isaac Sim use.  It is **not** required
-for the v2 Python pipeline.  If you need it:
-
-1. Install Isaac Sim via the [Omniverse Launcher](https://www.nvidia.com/en-us/omniverse/)
-   or build from source.
-2. Set `ISAAC_SIM_PATH` and run with Isaac Sim Python:
-   ```bat
-   isaacsim\_build\windows-x86_64\release\python.bat src/...
-   ```
-
----
-
-## 8. Citation
-
-If you use NemoForge or the SAGE-10k benchmark results in your research, please cite:
-
-```bibtex
-@article{xia2026sage,
-  title   = {SAGE: Scalable Agentic 3D Scene Generation for Embodied AI},
-  author  = {Xia, Hongchi and Li, Xuan and others},
-  journal = {arXiv preprint arXiv:2602.10116},
-  year    = {2026}
-}
-```
-
----
-
-## 9. License
-
-This project is released under the **Apache License 2.0**.
-See `NemoClaw/LICENSE` and `dataset/SAGE-10k/README.md` for third-party terms.
